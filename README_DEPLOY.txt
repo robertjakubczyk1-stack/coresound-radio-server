@@ -1,19 +1,18 @@
-CoreSound Radio Server V6 — forced public DNS
+CoreSound Radio Server V7
 
-Cel poprawki:
-- Railway zwracał ENOTFOUND dla rwnliqswwasrubqckhql.supabase.co.
-- V6 wymusza publiczne DNS resolvery: 1.1.1.1 oraz 8.8.8.8.
-- Wersja widoczna w /health i /debug: v6-forced-public-dns-2026-05-27.
+Fix:
+- Uses Supabase REST select=* instead of selecting audio_url directly.
+- This avoids schema errors like: column tracks.audio_url does not exist.
+- Keeps Railway public DNS / HTTPS fallback.
+- /health version: v7-select-star-schema-safe-2026-05-27
 
-Wgraj do repo coresound-radio-server:
-- server.js
-- package.json
-- .env.example
-- README_DEPLOY.txt
+Required Railway variables:
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
+PORT=3000
 
-Commit bezpośrednio do main.
-Po deployu sprawdź:
-/health
-/debug
-/now
-/live
+Test:
+GET /health
+GET /debug
+GET /now
+GET /live
