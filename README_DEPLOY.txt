@@ -1,11 +1,13 @@
-CoreSound Radio Server V4 REST Forced
+CoreSound Radio Server V5 — Network fallback
 
-This package deliberately removes @supabase/supabase-js.
-Railway logs should show:
-[CoreSound Radio Server] v4-rest-forced-2026-05-27 listening on 3000
+Wersja: v5-network-fallback-2026-05-27
 
-After deploy test:
-/health
-/debug
-/now
-/live
+Zmiany:
+- REST API Supabase bez SDK.
+- Fallback: jeśli global fetch pada na Railway, serwer próbuje node:https z IPv4.
+- /debug pokazuje DNS i dokładną przyczynę błędu.
+
+ENV:
+SUPABASE_URL=https://rwnliqswwasrubqckhql.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
+PORT=3000

@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.4-rest-forced",
+  "version": "1.0.5-network-fallback",
   "private": true,
   "type": "module",
   "scripts": {
