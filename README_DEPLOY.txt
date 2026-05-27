@@ -1,23 +1,11 @@
-CoreSound Radio Server V3 — REST fetch
-=====================================
+CoreSound Radio Server V4 REST Forced
 
-Ta wersja nie używa @supabase/supabase-js. Pobiera dane przez Supabase REST API.
+This package deliberately removes @supabase/supabase-js.
+Railway logs should show:
+[CoreSound Radio Server] v4-rest-forced-2026-05-27 listening on 3000
 
-Podmień w repo GitHub:
-- server.js
-- package.json
-- .env.example
-- README_DEPLOY.txt
-
-Railway ENV:
-- SUPABASE_URL=https://rwnliqswwasrubqckhql.supabase.co
-- SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
-- PORT=3000
-
-Testy po deployu:
+After deploy test:
 /health
 /debug
 /now
 /live
-
-Jeśli /debug pokazuje restTest ok:true, serwer widzi Supabase.
