@@ -1,22 +1,22 @@
-CoreSound Radio Server V9 — FFmpeg Continuous Stream
+CoreSound Radio Server V10 — FFmpeg skip bad links
 
-Purpose:
-- /live no longer proxies one MP3 at a time.
-- /live builds a long shuffled playlist and pipes it through FFmpeg as one continuous audio/mpeg stream.
-- This is designed to be more stable on Android when screen is locked.
+Fix:
+- Before building the FFmpeg playlist, the server checks audio URLs.
+- Broken Dropbox/Supabase links are skipped instead of killing the whole stream.
+- /debug shows lastSkippedBadLinks and cachedFfmpegValidTracks.
+- Keeps Dockerfile with ffmpeg installed.
 
 Required Railway variables:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
-PORT=3000
+PORT=8080 or Railway-provided PORT
 
-Important:
-- This package includes nixpacks.toml so Railway installs ffmpeg.
-- After deploy, test:
-  /health -> version v9-ffmpeg-continuous-stream-2026-05-27
-  /debug -> restTest.ok true
-  /now
-  /live
+Optional:
+STREAM_BITRATE=128k
+MAX_FFMPEG_PLAYLIST_TRACKS=80
+LINK_CHECK_TIMEOUT_MS=6500
 
-If /live fails with "ffmpeg not found", Railway did not apply nixpacks.toml or did not rebuild the image.
-Redeploy from latest commit or create a fresh service.
+Test:
+GET /health -> v10-ffmpeg-skip-bad-links-2026-05-27
+GET /debug
+GET /live

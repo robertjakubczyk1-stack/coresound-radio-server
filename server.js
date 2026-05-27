@@ -12,14 +12,17 @@ import cors from "cors"
 dns.setServers(["1.1.1.1", "8.8.8.8"])
 dns.setDefaultResultOrder("ipv4first")
 
-const VERSION = "v9-ffmpeg-continuous-stream-2026-05-27"
-const PORT = Number.parseInt(process.env.PORT || "3000", 10)
+const VERSION = "v10-ffmpeg-skip-bad-links-2026-05-27"
+const PORT = Number.parseInt(process.env.PORT || "8080", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"
 const MAX_TRACKS = 500
 const PLAYLIST_REPEAT_COUNT = 25
 const STREAM_BITRATE = process.env.STREAM_BITRATE || "128k"
+const LINK_CHECK_TIMEOUT_MS = Number.parseInt(process.env.LINK_CHECK_TIMEOUT_MS || "6500", 10)
+const MAX_FFMPEG_PLAYLIST_TRACKS = Number.parseInt(process.env.MAX_FFMPEG_PLAYLIST_TRACKS || "80", 10)
+const VALID_TRACKS_CACHE_MS = Number.parseInt(process.env.VALID_TRACKS_CACHE_MS || "300000", 10)
 
 const app = express()
 app.use(cors({ origin: ALLOWED_ORIGIN }))
@@ -29,6 +32,9 @@ let cachedTracks = []
 let lastTracksFetchAt = 0
 let lastTracksError = null
 let currentTrackIndex = 0
+let cachedFfmpegValidTracks = []
+let lastFfmpegValidTracksAt = 0
+let lastSkippedBadLinks = []
 
 function normalizeAudioUrl(input) {
   const raw = String(input || "").trim()
@@ -344,9 +350,146 @@ function escapeFfconcatPath(value) {
   return String(value || "").replace(/'/g, "'\\''")
 }
 
+async function checkTrackPlayableForFfmpeg(track) {
+  const audioUrl = String(track?.audioUrl || "").trim()
+  if (!audioUrl) {
+    return { ok: false, reason: "empty_audio_url" }
+  }
+
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), LINK_CHECK_TIMEOUT_MS)
+
+  try {
+    const res = await fetch(audioUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Range: "bytes=0-4095",
+        "User-Agent": "CoreSoundRadioServer/1.0",
+        Accept: "audio/*,*/*",
+      },
+    })
+
+    const contentType = String(res.headers.get("content-type") || "").toLowerCase()
+    const finalUrl = String(res.url || audioUrl)
+
+    if (!res.ok && res.status !== 206) {
+      return {
+        ok: false,
+        reason: `http_${res.status}`,
+        contentType,
+        finalUrl,
+      }
+    }
+
+    if (contentType.includes("text/html")) {
+      return {
+        ok: false,
+        reason: "html_instead_of_audio",
+        contentType,
+        finalUrl,
+      }
+    }
+
+    const looksAudio =
+      contentType.includes("audio") ||
+      contentType.includes("mpeg") ||
+      contentType.includes("octet-stream") ||
+      /\.(mp3|wav|m4a|aac|ogg|flac)(\?|$)/i.test(finalUrl) ||
+      /\.(mp3|wav|m4a|aac|ogg|flac)(\?|$)/i.test(audioUrl)
+
+    if (!looksAudio) {
+      return {
+        ok: false,
+        reason: `not_audio_content_type_${contentType || "empty"}`,
+        contentType,
+        finalUrl,
+      }
+    }
+
+    try {
+      await res.body?.cancel?.()
+    } catch {}
+
+    return {
+      ok: true,
+      contentType,
+      finalUrl,
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      reason: err?.name === "AbortError" ? "timeout" : (err?.message || String(err)),
+      code: err?.code || err?.cause?.code || null,
+    }
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function filterPlayableTracksForFfmpeg(tracks) {
+  const now = Date.now()
+
+  if (cachedFfmpegValidTracks.length > 0 && now - lastFfmpegValidTracksAt < VALID_TRACKS_CACHE_MS) {
+    return cachedFfmpegValidTracks
+  }
+
+  const shuffled = shuffleTracks(tracks).slice(0, Math.min(tracks.length, MAX_FFMPEG_PLAYLIST_TRACKS))
+  const valid = []
+  const skipped = []
+  const concurrency = 8
+  let index = 0
+
+  async function worker() {
+    while (index < shuffled.length) {
+      const current = shuffled[index]
+      index += 1
+
+      const result = await checkTrackPlayableForFfmpeg(current)
+
+      if (result.ok) {
+        valid.push({
+          ...current,
+          audioUrl: result.finalUrl || current.audioUrl,
+        })
+      } else {
+        skipped.push({
+          id: current.id,
+          title: current.title,
+          artistName: current.artistName,
+          reason: result.reason,
+          code: result.code || null,
+          contentType: result.contentType || null,
+        })
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()))
+
+  lastSkippedBadLinks = skipped.slice(0, 40)
+
+  if (valid.length === 0) {
+    throw new Error(`No FFmpeg-playable tracks after link check. Skipped ${skipped.length} links.`)
+  }
+
+  cachedFfmpegValidTracks = shuffleTracks(valid)
+  lastFfmpegValidTracksAt = Date.now()
+
+  console.log(
+    `[CoreSound Radio Server] FFmpeg playlist link check: valid=${cachedFfmpegValidTracks.length}, skipped=${skipped.length}`
+  )
+
+  if (skipped.length > 0) {
+    console.warn("[CoreSound Radio Server] skipped bad links sample:", JSON.stringify(lastSkippedBadLinks.slice(0, 8)))
+  }
+
+  return cachedFfmpegValidTracks
+}
+
 function buildLongFfconcatPlaylist(tracks) {
   const lines = ["ffconcat version 1.0"]
-
   let list = shuffleTracks(tracks)
 
   for (let repeat = 0; repeat < PLAYLIST_REPEAT_COUNT; repeat += 1) {
@@ -377,6 +520,12 @@ function startFfmpegContinuousStream(req, res, tracks) {
       "-re",
       "-protocol_whitelist",
       "file,http,https,tcp,tls,crypto",
+      "-reconnect",
+      "1",
+      "-reconnect_streamed",
+      "1",
+      "-reconnect_delay_max",
+      "2",
       "-f",
       "concat",
       "-safe",
@@ -397,7 +546,7 @@ function startFfmpegContinuousStream(req, res, tracks) {
       "pipe:1",
     ]
 
-    console.log(`[CoreSound Radio Server] starting ffmpeg stream with ${tracks.length} tracks, playlist ${playlistPath}`)
+    console.log(`[CoreSound Radio Server] starting ffmpeg stream with ${tracks.length} checked tracks, playlist ${playlistPath}`)
 
     const ffmpeg = spawn("ffmpeg", args, {
       stdio: ["ignore", "pipe", "pipe"],
@@ -417,10 +566,6 @@ function startFfmpegContinuousStream(req, res, tracks) {
         ffmpeg.kill("SIGTERM")
       } catch {}
 
-      windowlessCleanup()
-    }
-
-    const windowlessCleanup = () => {
       cleanup()
     }
 
@@ -464,7 +609,7 @@ function startFfmpegContinuousStream(req, res, tracks) {
     res.setHeader("Connection", "keep-alive")
     res.setHeader("X-Accel-Buffering", "no")
     res.setHeader("X-CoreSound-Version", VERSION)
-    res.setHeader("X-CoreSound-Mode", "ffmpeg-continuous")
+    res.setHeader("X-CoreSound-Mode", "ffmpeg-continuous-skip-bad-links")
     res.flushHeaders?.()
 
     ffmpeg.stdout.on("data", (chunk) => {
@@ -508,7 +653,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "coresound-radio-server",
     version: VERSION,
-    mode: "ffmpeg-continuous-mp3",
+    mode: "ffmpeg-continuous-mp3-skip-bad-links",
     time: new Date().toISOString(),
   })
 })
@@ -524,6 +669,11 @@ app.get("/debug", async (_req, res) => {
     serviceKeyPrefix: SUPABASE_SERVICE_ROLE_KEY ? SUPABASE_SERVICE_ROLE_KEY.slice(0, 12) : null,
     ffmpegExpected: true,
     cachedTracks: cachedTracks.length,
+    cachedFfmpegValidTracks: cachedFfmpegValidTracks.length,
+    lastFfmpegValidTracksAt: lastFfmpegValidTracksAt ? new Date(lastFfmpegValidTracksAt).toISOString() : null,
+    lastSkippedBadLinks,
+    linkCheckTimeoutMs: LINK_CHECK_TIMEOUT_MS,
+    maxFfmpegPlaylistTracks: MAX_FFMPEG_PLAYLIST_TRACKS,
     lastTracksFetchAt: lastTracksFetchAt ? new Date(lastTracksFetchAt).toISOString() : null,
     lastTracksError,
   }
@@ -551,7 +701,7 @@ app.get("/now", async (_req, res) => {
     res.json({
       ok: true,
       version: VERSION,
-      mode: "ffmpeg-continuous-mp3",
+      mode: "ffmpeg-continuous-mp3-skip-bad-links",
       track,
       poolSize,
       index,
@@ -569,6 +719,8 @@ app.get("/now", async (_req, res) => {
 app.post("/admin/refresh", async (_req, res) => {
   try {
     const tracks = await fetchTracksFromSupabase({ force: true })
+    cachedFfmpegValidTracks = []
+    lastFfmpegValidTracksAt = 0
     currentTrackIndex = 0
     res.json({ ok: true, version: VERSION, poolSize: tracks.length })
   } catch (err) {
@@ -584,12 +736,13 @@ app.post("/admin/skip", (_req, res) => {
 
 app.get("/live", async (req, res) => {
   try {
-    const tracks = await fetchTracksFromSupabase()
+    const allTracks = await fetchTracksFromSupabase()
 
-    if (tracks.length === 0) {
+    if (allTracks.length === 0) {
       throw new Error("No tracks available for continuous stream")
     }
 
+    const tracks = await filterPlayableTracksForFfmpeg(allTracks)
     await startFfmpegContinuousStream(req, res, tracks)
   } catch (err) {
     console.warn("[CoreSound Radio Server] ffmpeg live stream warning:", err?.message || err)

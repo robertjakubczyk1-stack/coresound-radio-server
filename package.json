@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.9-ffmpeg-continuous-stream",
+  "version": "1.0.10-ffmpeg-skip-bad-links",
   "private": true,
   "type": "module",
   "scripts": {
