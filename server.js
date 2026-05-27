@@ -7,7 +7,7 @@ import cors from "cors"
 dns.setServers(["1.1.1.1", "8.8.8.8"])
 dns.setDefaultResultOrder("ipv4first")
 
-const VERSION = "v7-select-star-schema-safe-2026-05-27"
+const VERSION = "v8-live-advance-after-stream-2026-05-27"
 const PORT = Number.parseInt(process.env.PORT || "3000", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
@@ -492,9 +492,11 @@ app.get("/live", async (req, res) => {
     const { track } = await getCurrentTrack()
     await streamRemoteAudio(req, res, track)
 
-    if (!req.headers.range) {
-      advanceTrack()
-    }
+    // V8: Browsers often request audio with Range headers.
+    // The previous version advanced only when there was no Range header,
+    // so direct /live playback could repeat the same track forever.
+    // After a successful stream finishes, advance the shared queue.
+    advanceTrack()
   } catch (err) {
     console.warn("[CoreSound Radio Server] live stream warning:", err?.message || err)
     lastTracksError = err?.message || String(err)
