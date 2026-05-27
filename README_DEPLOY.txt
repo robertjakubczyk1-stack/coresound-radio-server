@@ -1,17 +1,22 @@
-CoreSound Radio Server V8
+CoreSound Radio Server V9 — FFmpeg Continuous Stream
 
-Fix:
-- /live now advances the queue after successful stream completion even when browser uses Range requests.
-- This prevents repeating the same track forever in direct browser playback / RadioPanel restart flow.
-- Keeps V7 schema-safe select=* and public DNS workaround.
+Purpose:
+- /live no longer proxies one MP3 at a time.
+- /live builds a long shuffled playlist and pipes it through FFmpeg as one continuous audio/mpeg stream.
+- This is designed to be more stable on Android when screen is locked.
 
 Required Railway variables:
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
 PORT=3000
 
-Test:
-GET /health -> version v8-live-advance-after-stream-2026-05-27
-GET /debug
-GET /now
-GET /live
+Important:
+- This package includes nixpacks.toml so Railway installs ffmpeg.
+- After deploy, test:
+  /health -> version v9-ffmpeg-continuous-stream-2026-05-27
+  /debug -> restTest.ok true
+  /now
+  /live
+
+If /live fails with "ffmpeg not found", Railway did not apply nixpacks.toml or did not rebuild the image.
+Redeploy from latest commit or create a fresh service.

@@ -1,18 +1,25 @@
 import dns from "node:dns"
 import https from "node:https"
+import fs from "node:fs"
+import os from "node:os"
+import path from "node:path"
+import crypto from "node:crypto"
+import { spawn } from "node:child_process"
 import express from "express"
 import cors from "cors"
 
-// Force public DNS. Railway sometimes returns ENOTFOUND for Supabase via its internal resolver.
+// Railway DNS workaround.
 dns.setServers(["1.1.1.1", "8.8.8.8"])
 dns.setDefaultResultOrder("ipv4first")
 
-const VERSION = "v8-live-advance-after-stream-2026-05-27"
+const VERSION = "v9-ffmpeg-continuous-stream-2026-05-27"
 const PORT = Number.parseInt(process.env.PORT || "3000", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"
 const MAX_TRACKS = 500
+const PLAYLIST_REPEAT_COUNT = 25
+const STREAM_BITRATE = process.env.STREAM_BITRATE || "128k"
 
 const app = express()
 app.use(cors({ origin: ALLOWED_ORIGIN }))
@@ -129,7 +136,7 @@ function explainError(err) {
   }
 }
 
-function buildSupabaseRestUrl(path) {
+function buildSupabaseRestUrl(restPath) {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
     throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
   }
@@ -138,11 +145,11 @@ function buildSupabaseRestUrl(path) {
     throw new Error(`Invalid SUPABASE_URL: ${SUPABASE_URL || "EMPTY"}`)
   }
 
-  return `${SUPABASE_URL}${path}`
+  return `${SUPABASE_URL}${restPath}`
 }
 
-async function supabaseRestFetch(path, options = {}) {
-  const url = buildSupabaseRestUrl(path)
+async function supabaseRestFetch(restPath, options = {}) {
+  const url = buildSupabaseRestUrl(restPath)
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), 15000)
 
@@ -160,6 +167,7 @@ async function supabaseRestFetch(path, options = {}) {
 
     const text = await res.text()
     let json = null
+
     try {
       json = text ? JSON.parse(text) : null
     } catch {
@@ -176,9 +184,9 @@ async function supabaseRestFetch(path, options = {}) {
   }
 }
 
-function supabaseRestHttps(path, options = {}) {
+function supabaseRestHttps(restPath, options = {}) {
   return new Promise((resolve, reject) => {
-    const url = new URL(buildSupabaseRestUrl(path))
+    const url = new URL(buildSupabaseRestUrl(restPath))
 
     const req = https.request(
       {
@@ -225,14 +233,14 @@ function supabaseRestHttps(path, options = {}) {
   })
 }
 
-async function supabaseRest(path, options = {}) {
+async function supabaseRest(restPath, options = {}) {
   try {
-    return await supabaseRestFetch(path, options)
+    return await supabaseRestFetch(restPath, options)
   } catch (fetchErr) {
     console.warn("[CoreSound Radio Server] global fetch failed; trying https fallback:", explainError(fetchErr))
 
     try {
-      return await supabaseRestHttps(path, options)
+      return await supabaseRestHttps(restPath, options)
     } catch (httpsErr) {
       throw new Error(
         `fetch=${JSON.stringify(explainError(fetchErr))}; https=${JSON.stringify(explainError(httpsErr))}`
@@ -243,10 +251,12 @@ async function supabaseRest(path, options = {}) {
 
 function shuffleTracks(input) {
   const arr = [...input]
+
   for (let i = arr.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[arr[i], arr[j]] = [arr[j], arr[i]]
   }
+
   return arr
 }
 
@@ -255,14 +265,7 @@ function isPlayableStatus(status) {
 
   if (!clean) return true
 
-  return [
-    "active",
-    "published",
-    "visible",
-    "approved",
-    "public",
-    "live",
-  ].includes(clean)
+  return ["active", "published", "visible", "approved", "public", "live"].includes(clean)
 }
 
 async function fetchRowsFromTracks() {
@@ -271,24 +274,22 @@ async function fetchRowsFromTracks() {
   baseParams.set("limit", String(MAX_TRACKS))
   baseParams.set("order", "created_at.desc")
 
-  // Query 1: preferred active rows, but select=* so schema differences do not break on missing audio_url.
   try {
     return await supabaseRest(`/rest/v1/tracks?${baseParams.toString()}&status=in.(active,published,visible,approved,public,live)`)
   } catch (err) {
     console.warn("[CoreSound Radio Server] filtered tracks fetch warning:", err?.message || err)
   }
 
-  // Query 2: no status filter.
   try {
     return await supabaseRest(`/rest/v1/tracks?${baseParams.toString()}`)
   } catch (err) {
     console.warn("[CoreSound Radio Server] ordered tracks fetch warning:", err?.message || err)
   }
 
-  // Query 3: no order, in case created_at is missing on a future schema.
   const fallbackParams = new URLSearchParams()
   fallbackParams.set("select", "*")
   fallbackParams.set("limit", String(MAX_TRACKS))
+
   return await supabaseRest(`/rest/v1/tracks?${fallbackParams.toString()}`)
 }
 
@@ -339,55 +340,146 @@ function advanceTrack() {
   }
 }
 
-async function streamRemoteAudio(req, res, track) {
-  const upstreamHeaders = {}
-  if (req.headers.range) upstreamHeaders.Range = req.headers.range
+function escapeFfconcatPath(value) {
+  return String(value || "").replace(/'/g, "'\\''")
+}
 
-  const upstream = await fetch(track.audioUrl, {
-    headers: upstreamHeaders,
-    redirect: "follow",
-  })
+function buildLongFfconcatPlaylist(tracks) {
+  const lines = ["ffconcat version 1.0"]
 
-  if (!upstream.ok && upstream.status !== 206) {
-    throw new Error(`Audio upstream failed ${upstream.status} for track ${track.id}`)
-  }
+  let list = shuffleTracks(tracks)
 
-  const contentType = upstream.headers.get("content-type") || "audio/mpeg"
-  const contentLength = upstream.headers.get("content-length")
-  const contentRange = upstream.headers.get("content-range")
-  const acceptRanges = upstream.headers.get("accept-ranges") || "bytes"
+  for (let repeat = 0; repeat < PLAYLIST_REPEAT_COUNT; repeat += 1) {
+    if (repeat > 0) list = shuffleTracks(tracks)
 
-  res.status(upstream.status === 206 ? 206 : 200)
-  res.setHeader("Content-Type", contentType)
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
-  res.setHeader("Accept-Ranges", acceptRanges)
-  res.setHeader("X-CoreSound-Version", VERSION)
-  res.setHeader("X-CoreSound-Track-Id", track.id)
-  res.setHeader("X-CoreSound-Track-Title", encodeURIComponent(track.title))
-
-  if (contentLength) res.setHeader("Content-Length", contentLength)
-  if (contentRange) res.setHeader("Content-Range", contentRange)
-
-  if (!upstream.body) throw new Error("Audio upstream has no body")
-
-  const reader = upstream.body.getReader()
-
-  req.on("close", () => {
-    try {
-      reader.cancel()
-    } catch {}
-  })
-
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    if (!res.write(Buffer.from(value))) {
-      await new Promise((resolve) => res.once("drain", resolve))
+    for (const track of list) {
+      if (!track.audioUrl) continue
+      lines.push(`file '${escapeFfconcatPath(track.audioUrl)}'`)
     }
   }
 
-  res.end()
+  return `${lines.join("\n")}\n`
+}
+
+function startFfmpegContinuousStream(req, res, tracks) {
+  return new Promise((resolve, reject) => {
+    const playlistId = crypto.randomUUID()
+    const playlistPath = path.join(os.tmpdir(), `coresound-${playlistId}.ffconcat`)
+    const playlistContent = buildLongFfconcatPlaylist(tracks)
+
+    fs.writeFileSync(playlistPath, playlistContent, "utf8")
+
+    const args = [
+      "-hide_banner",
+      "-loglevel",
+      "warning",
+      "-nostdin",
+      "-re",
+      "-protocol_whitelist",
+      "file,http,https,tcp,tls,crypto",
+      "-f",
+      "concat",
+      "-safe",
+      "0",
+      "-i",
+      playlistPath,
+      "-vn",
+      "-ac",
+      "2",
+      "-ar",
+      "44100",
+      "-c:a",
+      "libmp3lame",
+      "-b:a",
+      STREAM_BITRATE,
+      "-f",
+      "mp3",
+      "pipe:1",
+    ]
+
+    console.log(`[CoreSound Radio Server] starting ffmpeg stream with ${tracks.length} tracks, playlist ${playlistPath}`)
+
+    const ffmpeg = spawn("ffmpeg", args, {
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+
+    let settled = false
+    let stderrBuffer = ""
+
+    const cleanup = () => {
+      try {
+        fs.unlinkSync(playlistPath)
+      } catch {}
+    }
+
+    const stop = () => {
+      try {
+        ffmpeg.kill("SIGTERM")
+      } catch {}
+
+      windowlessCleanup()
+    }
+
+    const windowlessCleanup = () => {
+      cleanup()
+    }
+
+    req.on("close", stop)
+    req.on("aborted", stop)
+    res.on("close", stop)
+
+    ffmpeg.stderr.on("data", (chunk) => {
+      const text = Buffer.from(chunk).toString("utf8")
+      stderrBuffer += text
+      if (stderrBuffer.length > 4000) stderrBuffer = stderrBuffer.slice(-4000)
+      console.warn("[CoreSound Radio Server] ffmpeg:", text.trim())
+    })
+
+    ffmpeg.on("error", (err) => {
+      cleanup()
+      if (!settled) {
+        settled = true
+        reject(err)
+      }
+    })
+
+    ffmpeg.on("close", (code) => {
+      cleanup()
+
+      if (!settled && code !== 0) {
+        settled = true
+        reject(new Error(`ffmpeg exited with code ${code}: ${stderrBuffer.slice(-1000)}`))
+        return
+      }
+
+      if (!settled) {
+        settled = true
+        resolve()
+      }
+    })
+
+    res.status(200)
+    res.setHeader("Content-Type", "audio/mpeg")
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+    res.setHeader("Connection", "keep-alive")
+    res.setHeader("X-Accel-Buffering", "no")
+    res.setHeader("X-CoreSound-Version", VERSION)
+    res.setHeader("X-CoreSound-Mode", "ffmpeg-continuous")
+    res.flushHeaders?.()
+
+    ffmpeg.stdout.on("data", (chunk) => {
+      if (!res.write(chunk)) {
+        ffmpeg.stdout.pause()
+        res.once("drain", () => ffmpeg.stdout.resume())
+      }
+    })
+
+    ffmpeg.stdout.on("end", () => {
+      try {
+        res.end()
+      } catch {}
+    })
+  })
 }
 
 async function dnsProbe() {
@@ -416,6 +508,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "coresound-radio-server",
     version: VERSION,
+    mode: "ffmpeg-continuous-mp3",
     time: new Date().toISOString(),
   })
 })
@@ -429,6 +522,7 @@ app.get("/debug", async (_req, res) => {
     supabaseUrlPreview: SUPABASE_URL ? `${SUPABASE_URL.slice(0, 35)}...` : null,
     serviceKeyPresent: Boolean(SUPABASE_SERVICE_ROLE_KEY),
     serviceKeyPrefix: SUPABASE_SERVICE_ROLE_KEY ? SUPABASE_SERVICE_ROLE_KEY.slice(0, 12) : null,
+    ffmpegExpected: true,
     cachedTracks: cachedTracks.length,
     lastTracksFetchAt: lastTracksFetchAt ? new Date(lastTracksFetchAt).toISOString() : null,
     lastTracksError,
@@ -457,6 +551,7 @@ app.get("/now", async (_req, res) => {
     res.json({
       ok: true,
       version: VERSION,
+      mode: "ffmpeg-continuous-mp3",
       track,
       poolSize,
       index,
@@ -489,16 +584,15 @@ app.post("/admin/skip", (_req, res) => {
 
 app.get("/live", async (req, res) => {
   try {
-    const { track } = await getCurrentTrack()
-    await streamRemoteAudio(req, res, track)
+    const tracks = await fetchTracksFromSupabase()
 
-    // V8: Browsers often request audio with Range headers.
-    // The previous version advanced only when there was no Range header,
-    // so direct /live playback could repeat the same track forever.
-    // After a successful stream finishes, advance the shared queue.
-    advanceTrack()
+    if (tracks.length === 0) {
+      throw new Error("No tracks available for continuous stream")
+    }
+
+    await startFfmpegContinuousStream(req, res, tracks)
   } catch (err) {
-    console.warn("[CoreSound Radio Server] live stream warning:", err?.message || err)
+    console.warn("[CoreSound Radio Server] ffmpeg live stream warning:", err?.message || err)
     lastTracksError = err?.message || String(err)
 
     if (!res.headersSent) {
