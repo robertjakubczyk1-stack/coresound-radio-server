@@ -1,74 +1,23 @@
-CoreSound Radio Server — Railway-ready
-======================================
+CoreSound Radio Server V3 — REST fetch
+=====================================
 
-CEL
----
-To jest osobny serwer radiowy dla CoreSound.
-Telefon odtwarza jeden ciągły endpoint:
+Ta wersja nie używa @supabase/supabase-js. Pobiera dane przez Supabase REST API.
 
-  /live
+Podmień w repo GitHub:
+- server.js
+- package.json
+- .env.example
+- README_DEPLOY.txt
 
-Dzięki temu telefon nie musi wykonywać JavaScriptowego onEnded między utworami.
-To ma ominąć problem Androida: ekran wygaszony -> JS śpi -> radio nie przeskakuje.
+Railway ENV:
+- SUPABASE_URL=https://rwnliqswwasrubqckhql.supabase.co
+- SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
+- PORT=3000
 
-PLIKI
------
-server.js
-package.json
-.env.example
-README_DEPLOY.txt
+Testy po deployu:
+/health
+/debug
+/now
+/live
 
-WDROŻENIE NA RAILWAY
--------------------
-1. Wejdź na Railway.
-2. New Project.
-3. Deploy from GitHub albo wrzuć ten folder jako nowy projekt.
-4. Ustaw zmienne ENV:
-
-   SUPABASE_URL
-   SUPABASE_SERVICE_ROLE_KEY
-   CORESOUND_RADIO_SLOT_SECONDS=210
-   ALLOWED_ORIGIN=*
-
-5. Railway sam ustawi PORT.
-6. Deploy.
-7. Po deployu sprawdź:
-
-   https://TWOJ-PROJEKT.up.railway.app/health
-   https://TWOJ-PROJEKT.up.railway.app/now
-   https://TWOJ-PROJEKT.up.railway.app/live
-
-UWAGA O SERVICE ROLE KEY
-------------------------
-SUPABASE_SERVICE_ROLE_KEY jest tajny.
-Nie wklejaj go publicznie i nie dawaj do frontendu.
-Może być tylko w ENV Railway.
-
-CO DALEJ
---------
-Po działającym /live trzeba zmienić CoreSound frontend:
-RadioPanel.tsx powinien dla CoreSound Radio używać:
-
-  https://TWOJ-PROJEKT.up.railway.app/live
-
-Zamiast lokalnych endpointów Vercel.
-
-OGRANICZENIA MVP
-----------------
-To jest MVP bez transkodowania.
-Serwer skleja kolejne pliki audio jako strumień audio/mpeg.
-Najlepiej działa, jeśli utwory są MP3.
-Jeżeli w bazie są różne formaty albo uszkodzone pliki, serwer je pominie i pójdzie dalej.
-
-ENDPOINTY
----------
-GET /health  - status serwera
-GET /now     - aktualny/ następny utwór według programu
-GET /refresh - wymusza odświeżenie puli z Supabase
-GET /live    - ciągły stream radia
-
-
-V2 diagnostics:
-- Added Node DNS ipv4first for Railway/Supabase fetch stability.
-- Added /debug endpoint showing safe environment diagnostics without exposing secrets.
-- /now returns detailed fetch cause when Supabase fetch fails.
+Jeśli /debug pokazuje restTest ok:true, serwer widzi Supabase.
