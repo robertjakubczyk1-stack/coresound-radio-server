@@ -1,22 +1,15 @@
-CoreSound Radio Server V10 — FFmpeg skip bad links
+CoreSound Radio Server V10B
 
 Fix:
-- Before building the FFmpeg playlist, the server checks audio URLs.
-- Broken Dropbox/Supabase links are skipped instead of killing the whole stream.
-- /debug shows lastSkippedBadLinks and cachedFfmpegValidTracks.
-- Keeps Dockerfile with ffmpeg installed.
+- Removed FFmpeg options not supported by Railway/Debian ffmpeg:
+  -reconnect
+  -reconnect_streamed
+  -reconnect_delay_max
 
-Required Railway variables:
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
-PORT=8080 or Railway-provided PORT
-
-Optional:
-STREAM_BITRATE=128k
-MAX_FFMPEG_PLAYLIST_TRACKS=80
-LINK_CHECK_TIMEOUT_MS=6500
+Expected health version:
+v10b-ffmpeg-no-reconnect-option-2026-05-27
 
 Test:
-GET /health -> v10-ffmpeg-skip-bad-links-2026-05-27
+GET /health
 GET /debug
 GET /live

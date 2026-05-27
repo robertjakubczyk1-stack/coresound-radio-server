@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.10-ffmpeg-skip-bad-links",
+  "version": "1.0.10b-ffmpeg-no-reconnect-option",
   "private": true,
   "type": "module",
   "scripts": {

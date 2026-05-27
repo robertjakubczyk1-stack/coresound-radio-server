@@ -12,7 +12,7 @@ import cors from "cors"
 dns.setServers(["1.1.1.1", "8.8.8.8"])
 dns.setDefaultResultOrder("ipv4first")
 
-const VERSION = "v10-ffmpeg-skip-bad-links-2026-05-27"
+const VERSION = "v10b-ffmpeg-no-reconnect-option-2026-05-27"
 const PORT = Number.parseInt(process.env.PORT || "8080", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
@@ -520,12 +520,6 @@ function startFfmpegContinuousStream(req, res, tracks) {
       "-re",
       "-protocol_whitelist",
       "file,http,https,tcp,tls,crypto",
-      "-reconnect",
-      "1",
-      "-reconnect_streamed",
-      "1",
-      "-reconnect_delay_max",
-      "2",
       "-f",
       "concat",
       "-safe",
