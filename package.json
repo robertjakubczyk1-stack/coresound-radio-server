@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.5-network-fallback",
+  "version": "1.0.6-forced-dns",
   "private": true,
   "type": "module",
   "scripts": {
@@ -8,8 +8,8 @@
     "dev": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
   },
   "engines": {
     "node": ">=20.0.0"

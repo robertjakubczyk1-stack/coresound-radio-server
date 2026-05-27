@@ -1,13 +1,19 @@
-CoreSound Radio Server V5 — Network fallback
+CoreSound Radio Server V6 — forced public DNS
 
-Wersja: v5-network-fallback-2026-05-27
+Cel poprawki:
+- Railway zwracał ENOTFOUND dla rwnliqswwasrubqckhql.supabase.co.
+- V6 wymusza publiczne DNS resolvery: 1.1.1.1 oraz 8.8.8.8.
+- Wersja widoczna w /health i /debug: v6-forced-public-dns-2026-05-27.
 
-Zmiany:
-- REST API Supabase bez SDK.
-- Fallback: jeśli global fetch pada na Railway, serwer próbuje node:https z IPv4.
-- /debug pokazuje DNS i dokładną przyczynę błędu.
+Wgraj do repo coresound-radio-server:
+- server.js
+- package.json
+- .env.example
+- README_DEPLOY.txt
 
-ENV:
-SUPABASE_URL=https://rwnliqswwasrubqckhql.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=sb_secret_...
-PORT=3000
+Commit bezpośrednio do main.
+Po deployu sprawdź:
+/health
+/debug
+/now
+/live

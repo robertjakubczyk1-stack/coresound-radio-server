@@ -4,8 +4,9 @@ import express from "express"
 import cors from "cors"
 
 dns.setDefaultResultOrder("ipv4first")
+dns.setServers(["1.1.1.1", "8.8.8.8"])
 
-const VERSION = "v5-network-fallback-2026-05-27"
+const VERSION = "v6-forced-public-dns-2026-05-27"
 const PORT = Number.parseInt(process.env.PORT || "3000", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
