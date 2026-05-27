@@ -66,3 +66,9 @@ GET /health  - status serwera
 GET /now     - aktualny/ następny utwór według programu
 GET /refresh - wymusza odświeżenie puli z Supabase
 GET /live    - ciągły stream radia
+
+
+V2 diagnostics:
+- Added Node DNS ipv4first for Railway/Supabase fetch stability.
+- Added /debug endpoint showing safe environment diagnostics without exposing secrets.
+- /now returns detailed fetch cause when Supabase fetch fails.

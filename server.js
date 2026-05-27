@@ -1,6 +1,9 @@
+import dns from "node:dns"
 import express from "express"
 import cors from "cors"
 import { createClient } from "@supabase/supabase-js"
+
+dns.setDefaultResultOrder("ipv4first")
 
 const PORT = Number.parseInt(process.env.PORT || "3001", 10)
 const SUPABASE_URL = process.env.SUPABASE_URL || ""
@@ -12,6 +15,35 @@ const CONFIG_KEY = "main"
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
   console.error("[CoreSound Radio Server] Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
+}
+
+function safeErrorDetails(error) {
+  const cause = error?.cause || {}
+  return {
+    message: String(error?.message || error),
+    name: error?.name || null,
+    code: cause?.code || error?.code || null,
+    errno: cause?.errno || null,
+    syscall: cause?.syscall || null,
+    hostname: cause?.hostname || null,
+  }
+}
+
+function safeSupabaseInfo() {
+  let host = null
+  try {
+    host = SUPABASE_URL ? new URL(SUPABASE_URL).hostname : null
+  } catch {
+    host = "invalid-url"
+  }
+
+  return {
+    supabaseUrlPresent: Boolean(SUPABASE_URL),
+    supabaseUrlHost: host,
+    serviceRoleKeyPresent: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+    serviceRoleKeyPrefix: SUPABASE_SERVICE_ROLE_KEY ? SUPABASE_SERVICE_ROLE_KEY.slice(0, 10) : null,
+    nodeVersion: process.version,
+  }
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -301,6 +333,10 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "coresound-radio-server", time: new Date().toISOString() })
 })
 
+app.get("/debug", (_req, res) => {
+  res.json({ ok: true, ...safeSupabaseInfo() })
+})
+
 app.get("/now", async (_req, res) => {
   try {
     const program = await loadProgram()
@@ -333,8 +369,8 @@ app.get("/now", async (_req, res) => {
       slot_seconds: program.slotSeconds,
     })
   } catch (error) {
-    console.error("[CoreSound Radio Server] /now error:", error)
-    res.status(500).json({ ok: false, error: String(error?.message || error) })
+    console.error("[CoreSound Radio Server] /now error:", safeErrorDetails(error))
+    res.status(500).json({ ok: false, error: String(error?.message || error), details: safeErrorDetails(error), supabase: safeSupabaseInfo() })
   }
 })
 
@@ -343,8 +379,8 @@ app.get("/refresh", async (_req, res) => {
     const program = await loadProgram({ force: true })
     res.json({ ok: true, pool_size: program.tracks.length, refreshed_at: new Date().toISOString() })
   } catch (error) {
-    console.error("[CoreSound Radio Server] /refresh error:", error)
-    res.status(500).json({ ok: false, error: String(error?.message || error) })
+    console.error("[CoreSound Radio Server] /refresh error:", safeErrorDetails(error))
+    res.status(500).json({ ok: false, error: String(error?.message || error), details: safeErrorDetails(error), supabase: safeSupabaseInfo() })
   }
 })
 
@@ -404,7 +440,7 @@ app.get("/live", async (req, res) => {
       const message = String(error?.message || error)
       if (message.includes("aborted") || message.includes("AbortError")) break
 
-      console.warn("[CoreSound Radio Server] live stream warning:", message)
+      console.warn("[CoreSound Radio Server] live stream warning:", safeErrorDetails(error))
 
       const program = await loadProgram().catch(() => null)
       const current = getTrackForSlot(program, slotOffset)
