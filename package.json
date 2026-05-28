@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.10b-ffmpeg-no-reconnect-option",
+  "version": "1.0.14b-always-on-buffer-guard",
   "private": true,
   "type": "module",
   "scripts": {

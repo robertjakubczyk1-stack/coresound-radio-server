@@ -12,17 +12,24 @@ import cors from "cors"
 dns.setServers(["1.1.1.1", "8.8.8.8"])
 dns.setDefaultResultOrder("ipv4first")
 
-const VERSION = "v10b-ffmpeg-no-reconnect-option-2026-05-27"
+const VERSION = "v14b-always-on-buffer-guard-2026-05-27"
 const PORT = Number.parseInt(process.env.PORT || "8080", 10)
 const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "")
 const SUPABASE_SERVICE_ROLE_KEY = String(process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim()
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*"
+
 const MAX_TRACKS = 500
-const PLAYLIST_REPEAT_COUNT = 25
 const STREAM_BITRATE = process.env.STREAM_BITRATE || "128k"
+const LOCAL_BUFFER_SIZE = Number.parseInt(process.env.LOCAL_BUFFER_SIZE || "4", 10)
+const DOWNLOAD_TIMEOUT_MS = Number.parseInt(process.env.DOWNLOAD_TIMEOUT_MS || "45000", 10)
+const MAX_DOWNLOAD_BYTES = Number.parseInt(process.env.MAX_DOWNLOAD_BYTES || String(80 * 1024 * 1024), 10)
 const LINK_CHECK_TIMEOUT_MS = Number.parseInt(process.env.LINK_CHECK_TIMEOUT_MS || "6500", 10)
-const MAX_FFMPEG_PLAYLIST_TRACKS = Number.parseInt(process.env.MAX_FFMPEG_PLAYLIST_TRACKS || "80", 10)
+const MAX_FFMPEG_PLAYLIST_TRACKS = Number.parseInt(process.env.MAX_FFMPEG_PLAYLIST_TRACKS || "100", 10)
 const VALID_TRACKS_CACHE_MS = Number.parseInt(process.env.VALID_TRACKS_CACHE_MS || "300000", 10)
+const ALWAYS_ON_RADIO = String(process.env.ALWAYS_ON_RADIO || "true").toLowerCase() !== "false"
+const RADIO_START_DELAY_MS = Number.parseInt(process.env.RADIO_START_DELAY_MS || "3000", 10)
+const BUFFER_FILL_MAX_ATTEMPTS = Number.parseInt(process.env.BUFFER_FILL_MAX_ATTEMPTS || "40", 10)
+const BROADCAST_RESTART_DELAY_MS = Number.parseInt(process.env.BROADCAST_RESTART_DELAY_MS || "5000", 10)
 
 const app = express()
 app.use(cors({ origin: ALLOWED_ORIGIN }))
@@ -31,10 +38,19 @@ app.use(express.json({ limit: "1mb" }))
 let cachedTracks = []
 let lastTracksFetchAt = 0
 let lastTracksError = null
-let currentTrackIndex = 0
 let cachedFfmpegValidTracks = []
 let lastFfmpegValidTracksAt = 0
 let lastSkippedBadLinks = []
+
+const clients = new Map()
+let clientCounter = 0
+let broadcastRunning = false
+let broadcastStopRequested = false
+let broadcastStartedAt = null
+let currentBroadcastTrack = null
+let currentBroadcastTrackStartedAt = null
+let currentFfmpeg = null
+let broadcastLoopPromise = null
 
 function normalizeAudioUrl(input) {
   const raw = String(input || "").trim()
@@ -173,7 +189,6 @@ async function supabaseRestFetch(restPath, options = {}) {
 
     const text = await res.text()
     let json = null
-
     try {
       json = text ? JSON.parse(text) : null
     } catch {
@@ -211,12 +226,10 @@ function supabaseRestHttps(restPath, options = {}) {
       },
       (res) => {
         const chunks = []
-
         res.on("data", (chunk) => chunks.push(chunk))
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8")
           let json = null
-
           try {
             json = text ? JSON.parse(text) : null
           } catch {
@@ -257,20 +270,16 @@ async function supabaseRest(restPath, options = {}) {
 
 function shuffleTracks(input) {
   const arr = [...input]
-
   for (let i = arr.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1))
     ;[arr[i], arr[j]] = [arr[j], arr[i]]
   }
-
   return arr
 }
 
 function isPlayableStatus(status) {
   const clean = String(status || "").trim().toLowerCase()
-
   if (!clean) return true
-
   return ["active", "published", "visible", "approved", "public", "live"].includes(clean)
 }
 
@@ -295,66 +304,52 @@ async function fetchRowsFromTracks() {
   const fallbackParams = new URLSearchParams()
   fallbackParams.set("select", "*")
   fallbackParams.set("limit", String(MAX_TRACKS))
-
   return await supabaseRest(`/rest/v1/tracks?${fallbackParams.toString()}`)
 }
 
 async function fetchTracksFromSupabase({ force = false } = {}) {
   const now = Date.now()
-
-  if (!force && cachedTracks.length > 0 && now - lastTracksFetchAt < 60_000) {
-    return cachedTracks
-  }
+  if (!force && cachedTracks.length > 0 && now - lastTracksFetchAt < 60_000) return cachedTracks
 
   const rows = await fetchRowsFromTracks()
-
   const tracks = (Array.isArray(rows) ? rows : [])
     .filter((row) => isPlayableStatus(row?.status))
     .map(mapTrack)
     .filter((track) => track.id && track.audioUrl)
 
   if (tracks.length === 0) {
-    throw new Error("No playable tracks found in Supabase tracks table. Check if rows have stream_url/audio URL field and active/visible status.")
+    throw new Error("No playable tracks found in Supabase tracks table. Check stream_url/audio URL field and active/visible status.")
   }
 
   cachedTracks = shuffleTracks(tracks)
   lastTracksFetchAt = now
   lastTracksError = null
-
   return cachedTracks
 }
 
-async function getCurrentTrack() {
-  const tracks = await fetchTracksFromSupabase()
+async function dnsProbe() {
+  const hostname = SUPABASE_URL ? new URL(SUPABASE_URL).hostname : ""
+  const out = { hostname, ipv4: null, ipv6: null, errors: [] }
+  if (!hostname) return out
 
-  if (currentTrackIndex >= tracks.length) currentTrackIndex = 0
-
-  const track = tracks[currentTrackIndex]
-  if (!track) throw new Error("No current track available")
-
-  return { track, poolSize: tracks.length, index: currentTrackIndex }
-}
-
-function advanceTrack() {
-  if (cachedTracks.length === 0) return
-
-  currentTrackIndex += 1
-
-  if (currentTrackIndex >= cachedTracks.length) {
-    cachedTracks = shuffleTracks(cachedTracks)
-    currentTrackIndex = 0
+  try {
+    out.ipv4 = await dns.promises.resolve4(hostname)
+  } catch (err) {
+    out.errors.push({ resolve4: explainError(err) })
   }
-}
 
-function escapeFfconcatPath(value) {
-  return String(value || "").replace(/'/g, "'\\''")
+  try {
+    out.ipv6 = await dns.promises.resolve6(hostname)
+  } catch (err) {
+    out.errors.push({ resolve6: explainError(err) })
+  }
+
+  return out
 }
 
 async function checkTrackPlayableForFfmpeg(track) {
   const audioUrl = String(track?.audioUrl || "").trim()
-  if (!audioUrl) {
-    return { ok: false, reason: "empty_audio_url" }
-  }
+  if (!audioUrl) return { ok: false, reason: "empty_audio_url" }
 
   const controller = new AbortController()
   const timeoutId = setTimeout(() => controller.abort(), LINK_CHECK_TIMEOUT_MS)
@@ -375,21 +370,11 @@ async function checkTrackPlayableForFfmpeg(track) {
     const finalUrl = String(res.url || audioUrl)
 
     if (!res.ok && res.status !== 206) {
-      return {
-        ok: false,
-        reason: `http_${res.status}`,
-        contentType,
-        finalUrl,
-      }
+      return { ok: false, reason: `http_${res.status}`, contentType, finalUrl }
     }
 
     if (contentType.includes("text/html")) {
-      return {
-        ok: false,
-        reason: "html_instead_of_audio",
-        contentType,
-        finalUrl,
-      }
+      return { ok: false, reason: "html_instead_of_audio", contentType, finalUrl }
     }
 
     const looksAudio =
@@ -400,27 +385,18 @@ async function checkTrackPlayableForFfmpeg(track) {
       /\.(mp3|wav|m4a|aac|ogg|flac)(\?|$)/i.test(audioUrl)
 
     if (!looksAudio) {
-      return {
-        ok: false,
-        reason: `not_audio_content_type_${contentType || "empty"}`,
-        contentType,
-        finalUrl,
-      }
+      return { ok: false, reason: `not_audio_content_type_${contentType || "empty"}`, contentType, finalUrl }
     }
 
     try {
       await res.body?.cancel?.()
     } catch {}
 
-    return {
-      ok: true,
-      contentType,
-      finalUrl,
-    }
+    return { ok: true, contentType, finalUrl }
   } catch (err) {
     return {
       ok: false,
-      reason: err?.name === "AbortError" ? "timeout" : (err?.message || String(err)),
+      reason: err?.name === "AbortError" ? "timeout" : err?.message || String(err),
       code: err?.code || err?.cause?.code || null,
     }
   } finally {
@@ -430,7 +406,6 @@ async function checkTrackPlayableForFfmpeg(track) {
 
 async function filterPlayableTracksForFfmpeg(tracks) {
   const now = Date.now()
-
   if (cachedFfmpegValidTracks.length > 0 && now - lastFfmpegValidTracksAt < VALID_TRACKS_CACHE_MS) {
     return cachedFfmpegValidTracks
   }
@@ -445,14 +420,10 @@ async function filterPlayableTracksForFfmpeg(tracks) {
     while (index < shuffled.length) {
       const current = shuffled[index]
       index += 1
-
       const result = await checkTrackPlayableForFfmpeg(current)
 
       if (result.ok) {
-        valid.push({
-          ...current,
-          audioUrl: result.finalUrl || current.audioUrl,
-        })
+        valid.push({ ...current, audioUrl: result.finalUrl || current.audioUrl })
       } else {
         skipped.push({
           id: current.id,
@@ -467,7 +438,6 @@ async function filterPlayableTracksForFfmpeg(tracks) {
   }
 
   await Promise.all(Array.from({ length: concurrency }, () => worker()))
-
   lastSkippedBadLinks = skipped.slice(0, 40)
 
   if (valid.length === 0) {
@@ -477,10 +447,7 @@ async function filterPlayableTracksForFfmpeg(tracks) {
   cachedFfmpegValidTracks = shuffleTracks(valid)
   lastFfmpegValidTracksAt = Date.now()
 
-  console.log(
-    `[CoreSound Radio Server] FFmpeg playlist link check: valid=${cachedFfmpegValidTracks.length}, skipped=${skipped.length}`
-  )
-
+  console.log(`[CoreSound Radio Server] FFmpeg playlist link check: valid=${valid.length}, skipped=${skipped.length}`)
   if (skipped.length > 0) {
     console.warn("[CoreSound Radio Server] skipped bad links sample:", JSON.stringify(lastSkippedBadLinks.slice(0, 8)))
   }
@@ -488,158 +455,307 @@ async function filterPlayableTracksForFfmpeg(tracks) {
   return cachedFfmpegValidTracks
 }
 
-function buildLongFfconcatPlaylist(tracks) {
-  const lines = ["ffconcat version 1.0"]
-  let list = shuffleTracks(tracks)
+async function downloadTrackToTmp(track) {
+  const audioUrl = String(track?.audioUrl || "").trim()
+  if (!audioUrl) throw new Error("empty_audio_url")
 
-  for (let repeat = 0; repeat < PLAYLIST_REPEAT_COUNT; repeat += 1) {
-    if (repeat > 0) list = shuffleTracks(tracks)
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS)
+  const fileId = crypto.randomUUID()
+  const filePath = path.join(os.tmpdir(), `coresound-track-${fileId}.audio`)
 
-    for (const track of list) {
-      if (!track.audioUrl) continue
-      lines.push(`file '${escapeFfconcatPath(track.audioUrl)}'`)
+  try {
+    console.log(`[CoreSound Radio Server] downloading to local cache: ${track.title} / ${track.id}`)
+
+    const res = await fetch(audioUrl, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "CoreSoundRadioServer/1.0",
+        Accept: "audio/*,*/*",
+      },
+    })
+
+    const contentType = String(res.headers.get("content-type") || "").toLowerCase()
+    if (!res.ok) throw new Error(`download_http_${res.status}`)
+    if (contentType.includes("text/html")) throw new Error("download_html_instead_of_audio")
+    if (!res.body) throw new Error("download_empty_body")
+
+    const tmpWrite = fs.createWriteStream(filePath)
+    const reader = res.body.getReader()
+    let total = 0
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      total += value.byteLength
+      if (total > MAX_DOWNLOAD_BYTES) {
+        try { await reader.cancel() } catch {}
+        throw new Error(`download_too_large_${total}`)
+      }
+
+      if (!tmpWrite.write(Buffer.from(value))) {
+        await new Promise((resolve) => tmpWrite.once("drain", resolve))
+      }
     }
-  }
 
-  return `${lines.join("\n")}\n`
+    await new Promise((resolve, reject) => {
+      tmpWrite.end((err) => err ? reject(err) : resolve())
+    })
+
+    const stat = fs.statSync(filePath)
+    if (!stat.size || stat.size < 1024) throw new Error(`download_too_small_${stat.size}`)
+
+    return { ...track, localPath: filePath, localSize: stat.size, downloadedAt: new Date().toISOString() }
+  } catch (err) {
+    try { fs.unlinkSync(filePath) } catch {}
+    throw err
+  } finally {
+    clearTimeout(timeoutId)
+  }
 }
 
-function startFfmpegContinuousStream(req, res, tracks) {
-  return new Promise((resolve, reject) => {
-    const playlistId = crypto.randomUUID()
-    const playlistPath = path.join(os.tmpdir(), `coresound-${playlistId}.ffconcat`)
-    const playlistContent = buildLongFfconcatPlaylist(tracks)
+function deleteLocalTrack(localTrack) {
+  const localPath = localTrack?.localPath
+  if (!localPath) return
+  try { fs.unlinkSync(localPath) } catch {}
+}
 
-    fs.writeFileSync(playlistPath, playlistContent, "utf8")
-
+async function pipeLocalTrackThroughFfmpeg(localTrack) {
+  return new Promise((resolve) => {
     const args = [
       "-hide_banner",
-      "-loglevel",
-      "warning",
+      "-loglevel", "warning",
       "-nostdin",
       "-re",
-      "-protocol_whitelist",
-      "file,http,https,tcp,tls,crypto",
-      "-f",
-      "concat",
-      "-safe",
-      "0",
-      "-i",
-      playlistPath,
+      "-i", localTrack.localPath,
       "-vn",
-      "-ac",
-      "2",
-      "-ar",
-      "44100",
-      "-c:a",
-      "libmp3lame",
-      "-b:a",
-      STREAM_BITRATE,
-      "-f",
-      "mp3",
+      "-ac", "2",
+      "-ar", "44100",
+      "-c:a", "libmp3lame",
+      "-b:a", STREAM_BITRATE,
+      "-f", "mp3",
       "pipe:1",
     ]
 
-    console.log(`[CoreSound Radio Server] starting ffmpeg stream with ${tracks.length} checked tracks, playlist ${playlistPath}`)
+    console.log(`[CoreSound Radio Server] playing local cached track: ${localTrack.title} / ${localTrack.id} / ${localTrack.localSize} bytes`)
+    const ffmpeg = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] })
+    currentFfmpeg = ffmpeg
 
-    const ffmpeg = spawn("ffmpeg", args, {
-      stdio: ["ignore", "pipe", "pipe"],
-    })
-
-    let settled = false
     let stderrBuffer = ""
-
-    const cleanup = () => {
-      try {
-        fs.unlinkSync(playlistPath)
-      } catch {}
-    }
-
-    const stop = () => {
-      try {
-        ffmpeg.kill("SIGTERM")
-      } catch {}
-
-      cleanup()
-    }
-
-    req.on("close", stop)
-    req.on("aborted", stop)
-    res.on("close", stop)
+    let wroteAnyAudio = false
 
     ffmpeg.stderr.on("data", (chunk) => {
       const text = Buffer.from(chunk).toString("utf8")
       stderrBuffer += text
-      if (stderrBuffer.length > 4000) stderrBuffer = stderrBuffer.slice(-4000)
+      if (stderrBuffer.length > 3000) stderrBuffer = stderrBuffer.slice(-3000)
       console.warn("[CoreSound Radio Server] ffmpeg:", text.trim())
     })
 
+    ffmpeg.stdout.on("data", (chunk) => {
+      wroteAnyAudio = true
+      broadcastChunk(chunk)
+    })
+
     ffmpeg.on("error", (err) => {
-      cleanup()
-      if (!settled) {
-        settled = true
-        reject(err)
-      }
+      currentFfmpeg = null
+      console.warn(`[CoreSound Radio Server] local ffmpeg spawn error for ${localTrack.id}:`, err?.message || err)
+      resolve({ ok: false, wroteAnyAudio, error: err?.message || String(err) })
     })
 
     ffmpeg.on("close", (code) => {
-      cleanup()
-
-      if (!settled && code !== 0) {
-        settled = true
-        reject(new Error(`ffmpeg exited with code ${code}: ${stderrBuffer.slice(-1000)}`))
+      currentFfmpeg = null
+      if (code === 0 || wroteAnyAudio) {
+        resolve({ ok: code === 0, wroteAnyAudio, code })
         return
       }
 
-      if (!settled) {
-        settled = true
-        resolve()
-      }
-    })
-
-    res.status(200)
-    res.setHeader("Content-Type", "audio/mpeg")
-    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
-    res.setHeader("Connection", "keep-alive")
-    res.setHeader("X-Accel-Buffering", "no")
-    res.setHeader("X-CoreSound-Version", VERSION)
-    res.setHeader("X-CoreSound-Mode", "ffmpeg-continuous-skip-bad-links")
-    res.flushHeaders?.()
-
-    ffmpeg.stdout.on("data", (chunk) => {
-      if (!res.write(chunk)) {
-        ffmpeg.stdout.pause()
-        res.once("drain", () => ffmpeg.stdout.resume())
-      }
-    })
-
-    ffmpeg.stdout.on("end", () => {
-      try {
-        res.end()
-      } catch {}
+      console.warn(`[CoreSound Radio Server] local ffmpeg track failed, skipping ${localTrack.id}, code=${code}, stderr=${stderrBuffer.slice(-800)}`)
+      resolve({ ok: false, wroteAnyAudio, code, error: stderrBuffer.slice(-800) })
     })
   })
 }
 
-async function dnsProbe() {
-  const hostname = SUPABASE_URL ? new URL(SUPABASE_URL).hostname : ""
-  const out = { hostname, ipv4: null, ipv6: null, errors: [] }
+function createTrackPicker(tracks) {
+  let playlist = shuffleTracks(tracks)
+  let index = 0
 
-  if (!hostname) return out
+  return function pickNextTrack() {
+    if (playlist.length === 0) return null
+    if (index >= playlist.length) {
+      playlist = shuffleTracks(tracks)
+      index = 0
+    }
+    const track = playlist[index]
+    index += 1
+    return track
+  }
+}
 
-  try {
-    out.ipv4 = await dns.promises.resolve4(hostname)
-  } catch (err) {
-    out.errors.push({ resolve4: explainError(err) })
+async function fillLocalBuffer(buffer, pickNextTrack, reason = "normal") {
+  let attempts = 0
+  let successes = 0
+  const startedWith = buffer.length
+
+  while (!broadcastStopRequested && buffer.length < LOCAL_BUFFER_SIZE && attempts < BUFFER_FILL_MAX_ATTEMPTS) {
+    attempts += 1
+
+    const candidate = pickNextTrack()
+    if (!candidate) break
+
+    try {
+      const localTrack = await downloadTrackToTmp(candidate)
+      buffer.push(localTrack)
+      successes += 1
+      console.log(
+        `[CoreSound Radio Server] local buffer filled: ${buffer.length}/${LOCAL_BUFFER_SIZE}, attempts=${attempts}, reason=${reason}`
+      )
+    } catch (err) {
+      console.warn(
+        `[CoreSound Radio Server] download failed, skipping ${candidate?.id || "unknown"}, attempts=${attempts}/${BUFFER_FILL_MAX_ATTEMPTS}:`,
+        err?.message || err
+      )
+    }
   }
 
-  try {
-    out.ipv6 = await dns.promises.resolve6(hostname)
-  } catch (err) {
-    out.errors.push({ resolve6: explainError(err) })
+  if (buffer.length === startedWith && successes === 0) {
+    console.warn(
+      `[CoreSound Radio Server] buffer refill made no progress, reason=${reason}, attempts=${attempts}/${BUFFER_FILL_MAX_ATTEMPTS}`
+    )
   }
 
-  return out
+  return {
+    ok: buffer.length > startedWith,
+    attempts,
+    successes,
+    bufferSize: buffer.length,
+  }
+}
+
+function broadcastChunk(chunk) {
+  for (const [id, client] of clients.entries()) {
+    try {
+      if (client.res.destroyed || client.res.writableEnded) {
+        clients.delete(id)
+        continue
+      }
+      client.res.write(chunk)
+    } catch {
+      clients.delete(id)
+    }
+  }
+}
+
+async function ensureBroadcastEngineRunning() {
+  if (broadcastRunning || broadcastLoopPromise) return broadcastLoopPromise
+
+  broadcastStopRequested = false
+  broadcastRunning = true
+  broadcastStartedAt = new Date().toISOString()
+
+  broadcastLoopPromise = runBroadcastLoop()
+    .catch((err) => {
+      console.warn("[CoreSound Radio Server] broadcast loop crashed:", err?.message || err)
+      lastTracksError = err?.message || String(err)
+    })
+    .finally(() => {
+      broadcastRunning = false
+      broadcastLoopPromise = null
+      currentBroadcastTrack = null
+      currentBroadcastTrackStartedAt = null
+      currentFfmpeg = null
+      broadcastStartedAt = null
+
+      if (ALWAYS_ON_RADIO) {
+        setTimeout(() => {
+          if (!broadcastRunning && !broadcastLoopPromise) {
+            console.log("[CoreSound Radio Server] restarting always-on broadcast engine after stop/crash")
+            void ensureBroadcastEngineRunning()
+          }
+        }, BROADCAST_RESTART_DELAY_MS)
+      }
+    })
+
+  return broadcastLoopPromise
+}
+
+async function runBroadcastLoop() {
+  console.log("[CoreSound Radio Server] always-on shared broadcast engine starting")
+  let allTracks = await fetchTracksFromSupabase()
+  let validTracks = await filterPlayableTracksForFfmpeg(allTracks)
+  const localBuffer = []
+  let pickNextTrack = createTrackPicker(validTracks)
+  let failureStreak = 0
+
+  await fillLocalBuffer(localBuffer, pickNextTrack, "initial")
+
+  while (!broadcastStopRequested) {
+    if (localBuffer.length === 0) {
+      console.warn("[CoreSound Radio Server] local buffer empty; trying refill")
+      await fillLocalBuffer(localBuffer, pickNextTrack, "initial")
+
+      if (localBuffer.length === 0) {
+        throw new Error("No locally cached tracks available for always-on broadcast")
+      }
+    }
+
+    const localTrack = localBuffer.shift()
+    void fillLocalBuffer(localBuffer, pickNextTrack, "background").catch((err) => {
+      console.warn("[CoreSound Radio Server] background buffer refill warning:", err?.message || err)
+    })
+
+    currentBroadcastTrack = {
+      id: localTrack.id,
+      title: localTrack.title,
+      artistName: localTrack.artistName,
+      genre: localTrack.genre,
+      coverUrl: localTrack.coverUrl,
+    }
+    currentBroadcastTrackStartedAt = new Date().toISOString()
+
+    try {
+      const result = await pipeLocalTrackThroughFfmpeg(localTrack)
+      if (result.ok || result.wroteAnyAudio) failureStreak = 0
+      else failureStreak += 1
+    } finally {
+      deleteLocalTrack(localTrack)
+    }
+
+    if (failureStreak >= 8) {
+      console.warn("[CoreSound Radio Server] too many playback failures; refreshing track cache")
+      cachedTracks = []
+      cachedFfmpegValidTracks = []
+      lastFfmpegValidTracksAt = 0
+      allTracks = await fetchTracksFromSupabase({ force: true })
+      validTracks = await filterPlayableTracksForFfmpeg(allTracks)
+      pickNextTrack = createTrackPicker(validTracks)
+      failureStreak = 0
+    }
+  }
+
+  for (const localTrack of localBuffer) deleteLocalTrack(localTrack)
+  console.log("[CoreSound Radio Server] always-on shared broadcast engine stopped")
+}
+
+function attachClient(req, res) {
+  const id = String(++clientCounter)
+  clients.set(id, {
+    id,
+    res,
+    connectedAt: new Date().toISOString(),
+    userAgent: req.headers["user-agent"] || null,
+  })
+
+  const cleanup = () => {
+    clients.delete(id)
+  }
+
+  req.on("close", cleanup)
+  req.on("aborted", cleanup)
+  res.on("close", cleanup)
+  return id
 }
 
 app.get("/health", (_req, res) => {
@@ -647,7 +763,10 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "coresound-radio-server",
     version: VERSION,
-    mode: "ffmpeg-continuous-mp3-skip-bad-links",
+    mode: "always-on-shared-broadcast-local-cache-buffer",
+    clients: clients.size,
+    broadcastRunning,
+    currentBroadcastTrack,
     time: new Date().toISOString(),
   })
 })
@@ -661,22 +780,29 @@ app.get("/debug", async (_req, res) => {
     supabaseUrlPreview: SUPABASE_URL ? `${SUPABASE_URL.slice(0, 35)}...` : null,
     serviceKeyPresent: Boolean(SUPABASE_SERVICE_ROLE_KEY),
     serviceKeyPrefix: SUPABASE_SERVICE_ROLE_KEY ? SUPABASE_SERVICE_ROLE_KEY.slice(0, 12) : null,
-    ffmpegExpected: true,
+    alwaysOnRadio: ALWAYS_ON_RADIO,
+    radioStartDelayMs: RADIO_START_DELAY_MS,
+    broadcastRestartDelayMs: BROADCAST_RESTART_DELAY_MS,
+    bufferFillMaxAttempts: BUFFER_FILL_MAX_ATTEMPTS,
+    clients: clients.size,
+    broadcastRunning,
+    broadcastStartedAt,
+    currentBroadcastTrack,
+    currentBroadcastTrackStartedAt,
     cachedTracks: cachedTracks.length,
     cachedFfmpegValidTracks: cachedFfmpegValidTracks.length,
     lastFfmpegValidTracksAt: lastFfmpegValidTracksAt ? new Date(lastFfmpegValidTracksAt).toISOString() : null,
     lastSkippedBadLinks,
+    localBufferSize: LOCAL_BUFFER_SIZE,
+    downloadTimeoutMs: DOWNLOAD_TIMEOUT_MS,
+    maxDownloadBytes: MAX_DOWNLOAD_BYTES,
     linkCheckTimeoutMs: LINK_CHECK_TIMEOUT_MS,
     maxFfmpegPlaylistTracks: MAX_FFMPEG_PLAYLIST_TRACKS,
     lastTracksFetchAt: lastTracksFetchAt ? new Date(lastTracksFetchAt).toISOString() : null,
     lastTracksError,
   }
 
-  try {
-    debug.dns = await dnsProbe()
-  } catch (err) {
-    debug.dns = { ok: false, error: explainError(err) }
-  }
+  try { debug.dns = await dnsProbe() } catch (err) { debug.dns = { ok: false, error: explainError(err) } }
 
   try {
     const rows = await supabaseRest("/rest/v1/tracks?select=*&limit=1")
@@ -691,31 +817,32 @@ app.get("/debug", async (_req, res) => {
 
 app.get("/now", async (_req, res) => {
   try {
-    const { track, poolSize, index } = await getCurrentTrack()
+    if (!broadcastRunning) void ensureBroadcastEngineRunning()
+
     res.json({
       ok: true,
       version: VERSION,
-      mode: "ffmpeg-continuous-mp3-skip-bad-links",
-      track,
-      poolSize,
-      index,
+      mode: "always-on-shared-broadcast-local-cache-buffer",
+      clients: clients.size,
+      broadcastRunning,
+      broadcastStartedAt,
+      track: currentBroadcastTrack,
+      trackStartedAt: currentBroadcastTrackStartedAt,
+      cachedTracks: cachedTracks.length,
+      cachedFfmpegValidTracks: cachedFfmpegValidTracks.length,
     })
   } catch (err) {
     lastTracksError = err?.message || String(err)
-    res.status(500).json({
-      ok: false,
-      version: VERSION,
-      error: `Supabase tracks fetch failed: ${lastTracksError}`,
-    })
+    res.status(500).json({ ok: false, version: VERSION, error: lastTracksError })
   }
 })
 
 app.post("/admin/refresh", async (_req, res) => {
   try {
-    const tracks = await fetchTracksFromSupabase({ force: true })
+    cachedTracks = []
     cachedFfmpegValidTracks = []
     lastFfmpegValidTracksAt = 0
-    currentTrackIndex = 0
+    const tracks = await fetchTracksFromSupabase({ force: true })
     res.json({ ok: true, version: VERSION, poolSize: tracks.length })
   } catch (err) {
     lastTracksError = err?.message || String(err)
@@ -723,44 +850,41 @@ app.post("/admin/refresh", async (_req, res) => {
   }
 })
 
-app.post("/admin/skip", (_req, res) => {
-  advanceTrack()
-  res.json({ ok: true, version: VERSION, nextIndex: currentTrackIndex })
+app.post("/admin/restart", (_req, res) => {
+  broadcastStopRequested = true
+  try { currentFfmpeg?.kill("SIGTERM") } catch {}
+  setTimeout(() => void ensureBroadcastEngineRunning(), 500)
+  res.json({ ok: true, version: VERSION, message: "Broadcast restart requested." })
 })
 
 app.get("/live", async (req, res) => {
-  try {
-    const allTracks = await fetchTracksFromSupabase()
+  res.status(200)
+  res.setHeader("Content-Type", "audio/mpeg")
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate")
+  res.setHeader("Connection", "keep-alive")
+  res.setHeader("X-Accel-Buffering", "no")
+  res.setHeader("X-CoreSound-Version", VERSION)
+  res.setHeader("X-CoreSound-Mode", "always-on-shared-broadcast-local-cache-buffer")
+  res.flushHeaders?.()
 
-    if (allTracks.length === 0) {
-      throw new Error("No tracks available for continuous stream")
-    }
-
-    const tracks = await filterPlayableTracksForFfmpeg(allTracks)
-    await startFfmpegContinuousStream(req, res, tracks)
-  } catch (err) {
-    console.warn("[CoreSound Radio Server] ffmpeg live stream warning:", err?.message || err)
-    lastTracksError = err?.message || String(err)
-
-    if (!res.headersSent) {
-      res.status(500).json({ ok: false, version: VERSION, error: lastTracksError })
-    } else {
-      try {
-        res.end()
-      } catch {}
-    }
-  }
+  const id = attachClient(req, res)
+  console.log(`[CoreSound Radio Server] client ${id} connected. listeners=${clients.size}`)
+  void ensureBroadcastEngineRunning()
 })
 
 app.use((_req, res) => {
-  res.status(404).json({
-    ok: false,
-    version: VERSION,
-    error: "Not found",
-  })
+  res.status(404).json({ ok: false, version: VERSION, error: "Not found" })
 })
 
 app.listen(PORT, () => {
   console.log(`[CoreSound Radio Server] ${VERSION} listening on ${PORT}`)
   console.log(`[CoreSound Radio Server] SUPABASE_URL present: ${Boolean(SUPABASE_URL)}`)
+  console.log(`[CoreSound Radio Server] ALWAYS_ON_RADIO: ${ALWAYS_ON_RADIO}`)
+
+  if (ALWAYS_ON_RADIO) {
+    setTimeout(() => {
+      console.log("[CoreSound Radio Server] auto-starting always-on broadcast engine")
+      void ensureBroadcastEngineRunning()
+    }, RADIO_START_DELAY_MS)
+  }
 })
