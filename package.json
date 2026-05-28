@@ -1,6 +1,6 @@
 {
   "name": "coresound-radio-server",
-  "version": "1.0.14b-always-on-buffer-guard",
+  "version": "1.0.15-hls-broadcast-engine",
   "private": true,
   "type": "module",
   "scripts": {
