@@ -1,17 +1,19 @@
 {
-  "name": "coresound-radio-server",
-  "version": "1.0.15-hls-broadcast-engine",
+  "name": "coresound-radio-stream-engine",
+  "version": "2.0.0-stage1",
   "private": true,
   "type": "module",
+  "description": "CoreSound Radio Stream Engine V2 - HLS worker using CoreSound /api/radio/now-playing as source of truth.",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node src/server.js",
+    "dev": "NODE_ENV=development node src/server.js",
+    "check": "node src/check-env.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
     "express": "^4.19.2"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=20"
   }
 }
