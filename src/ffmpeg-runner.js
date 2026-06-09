@@ -49,12 +49,59 @@ function parseFfmpegTimeSeconds(text) {
   return hours * 3600 + minutes * 60 + seconds
 }
 
+function escapeFfconcatPath(filePath) {
+  // ffconcat akceptuje ścieżki w pojedynczych cudzysłowach.
+  // Apostrof w nazwie pliku trzeba uciec zgodnie z regułami FFmpeg concat demuxer.
+  return String(filePath).replace(/'/g, "'\\''")
+}
+
+async function writeConcatFile(tracks) {
+  await ensureHlsDir()
+
+  const concatFile = path.join(config.hlsDir, `ffconcat-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`)
+  const lines = ['ffconcat version 1.0']
+
+  for (const track of tracks) {
+    const localPath = track.cachedPath || track.localPath || track.streamUrl
+    if (!localPath) continue
+    lines.push(`file '${escapeFfconcatPath(localPath)}'`)
+  }
+
+  await fs.writeFile(concatFile, `${lines.join('\n')}\n`, 'utf8')
+  return concatFile
+}
+
+async function cleanupOldConcatFiles() {
+  await ensureHlsDir()
+
+  const entries = await fs.readdir(config.hlsDir).catch(() => [])
+  const now = Date.now()
+
+  await Promise.all(
+    entries
+      .filter((entry) => /^ffconcat-\d+-[a-f0-9]+\.txt$/.test(entry))
+      .map(async (entry) => {
+        const file = path.join(config.hlsDir, entry)
+        try {
+          const stat = await fs.stat(file)
+          if (now - stat.mtimeMs > 10 * 60 * 1000) {
+            await fs.unlink(file)
+          }
+        } catch {
+          // ignore cleanup errors
+        }
+      }),
+  )
+}
+
 async function buildArgs(snapshot) {
   const { prepared, rejected } = await trackCache.prepareQueue(snapshot, config.preloadTrackCount)
 
   if (prepared.length === 0) {
     throw new Error('No locally cached tracks available for FFmpeg')
   }
+
+  await cleanupOldConcatFiles()
 
   const tracks = prepared
   const current = tracks[0]
@@ -68,23 +115,26 @@ async function buildArgs(snapshot) {
 
   const previousLastSegment = await latestSegmentNumber()
   const startNumber = previousLastSegment + 1
+  const concatFile = await writeConcatFile(tracks)
 
-  const args = ['-hide_banner', '-y']
+  // Krytyczna poprawka:
+  // Poprzednia wersja podawała kilka wejść -re -i ... i łączyła je przez filter_complex concat.
+  // Przy wielu równoległych wejściach FFmpeg potrafił produkować HLS szybciej niż czas rzeczywisty
+  // (np. speed=2.64x), przez co mediaSequence rosło skokowo i player przeskakiwał.
+  //
+  // Teraz używamy jednego wejścia concat demuxer + jedno -re przed tym wejściem.
+  // To wymusza real-time pacing całego strumienia: docelowo speed powinien być ~1x.
+  const args = [
+    '-hide_banner',
+    '-y',
 
-  tracks.forEach((track) => {
-    args.push('-re')
-    args.push('-i', track.streamUrl)
-  })
-
-  const concatInputs = tracks.map((_, index) => `[${index}:a:0]`).join('')
-  const filter = `${concatInputs}concat=n=${tracks.length}:v=0:a=1[aout]`
-
-  args.push(
-    '-filter_complex',
-    filter,
-
-    '-map',
-    '[aout]',
+    '-re',
+    '-f',
+    'concat',
+    '-safe',
+    '0',
+    '-i',
+    concatFile,
 
     '-vn',
     '-c:a',
@@ -123,7 +173,7 @@ async function buildArgs(snapshot) {
     segmentPattern,
 
     outputPlaylist,
-  )
+  ]
 
   return {
     args,
@@ -135,6 +185,7 @@ async function buildArgs(snapshot) {
     seekSeconds,
     startNumber,
     previousLastSegment,
+    concatFile,
   }
 }
 
@@ -155,6 +206,7 @@ export class FfmpegRunner {
     this.lastProgressText = ''
     this.stallRestarting = false
     this.lastRejectedTracks = []
+    this.currentConcatFile = null
   }
 
   isRunning() {
@@ -278,8 +330,10 @@ export class FfmpegRunner {
       seekSeconds,
       startNumber,
       previousLastSegment,
+      concatFile,
     } = await buildArgs(snapshot)
 
+    this.currentConcatFile = concatFile
     this.currentTrackId = current.id
     this.startedAtMs = Date.now()
     this.snapshot = snapshot
@@ -289,7 +343,7 @@ export class FfmpegRunner {
 
     log.info('Starting FFmpeg HLS stream', {
       reason,
-      mode: 'local-cache-prebuffer-hls-no-seek',
+      mode: 'local-cache-prebuffer-hls-concat-demuxer-realtime',
       current: `${safeName(current.artistName)} - ${safeName(current.title)}`,
       positionSeconds: snapshot.positionSeconds,
       seekSeconds,
@@ -302,6 +356,8 @@ export class FfmpegRunner {
       startNumber,
       progressStallMs: FFMPEG_PROGRESS_STALL_MS,
       hlsFlags: 'append_list+delete_segments+program_date_time+independent_segments+omit_endlist+temp_file',
+      pacing: 'single -re concat demuxer, target speed ~= 1x',
+      concatFile,
       inputs: tracks.map((track) => ({
         title: `${safeName(track.artistName)} - ${safeName(track.title)}`,
         cachedPath: track.cachedPath,
@@ -334,7 +390,7 @@ export class FfmpegRunner {
       log.warn(`ffmpeg: ${text}`)
     })
 
-    child.on('error', (err) => {
+    child.on('error', async (err) => {
       this.lastStartError = {
         message: err.message,
         code: err.code || null,
@@ -349,6 +405,11 @@ export class FfmpegRunner {
 
       this.clearProgressWatchdog()
 
+      if (this.currentConcatFile) {
+        await fs.unlink(this.currentConcatFile).catch(() => {})
+        this.currentConcatFile = null
+      }
+
       if (!this.manualStop && this.onExit) {
         this.onExit({
           code: null,
@@ -360,7 +421,7 @@ export class FfmpegRunner {
       }
     })
 
-    child.on('exit', (code, signal) => {
+    child.on('exit', async (code, signal) => {
       this.lastExit = {
         code,
         signal,
@@ -376,6 +437,11 @@ export class FfmpegRunner {
       }
 
       this.clearProgressWatchdog()
+
+      if (this.currentConcatFile) {
+        await fs.unlink(this.currentConcatFile).catch(() => {})
+        this.currentConcatFile = null
+      }
 
       const shouldRestart = !this.manualStop && this.onExit
 
@@ -420,5 +486,10 @@ export class FfmpegRunner {
         resolve()
       })
     })
+
+    if (this.currentConcatFile) {
+      await fs.unlink(this.currentConcatFile).catch(() => {})
+      this.currentConcatFile = null
+    }
   }
 }
