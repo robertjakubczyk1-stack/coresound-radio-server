@@ -292,12 +292,12 @@ app.get('/player', (_req, res) => {
 
         const waitingForMs = Date.now() - waitingSince
 
-        if (waitingForMs > 10000 && waitingForMs <= 30000) {
+        if (waitingForMs > 20000 && waitingForMs <= 90000) {
           softRecover('waiting-too-long')
         }
 
-        if (waitingForMs > 30000) {
-          hardReload('waiting-over-30s')
+        if (waitingForMs > 90000) {
+          hardReload('waiting-over-90s')
         }
       }, 2000)
     }
@@ -314,16 +314,19 @@ app.get('/player', (_req, res) => {
 
       if (Hls.isSupported()) {
         hls = new Hls({
-          liveSyncDurationCount: 6,
-          liveMaxLatencyDurationCount: 24,
+          // Stabilny tryb radia: nie gonimy agresywnie live edge.
+          // Player ma grać z bezpiecznym opóźnieniem, żeby nie przeskakiwał.
+          lowLatencyMode: false,
+          liveSyncDuration: 90,
+          liveMaxLatencyDuration: 240,
+          maxLiveSyncPlaybackRate: 1,
           maxBufferLength: 180,
           maxMaxBufferLength: 360,
-          backBufferLength: 20,
+          backBufferLength: 120,
           enableWorker: true,
-          lowLatencyMode: false,
-          nudgeOffset: 0.1,
-          nudgeMaxRetry: 4,
-          maxFragLookUpTolerance: 0.5,
+          nudgeOffset: 0.05,
+          nudgeMaxRetry: 2,
+          maxFragLookUpTolerance: 0.25,
           manifestLoadingTimeOut: 20000,
           manifestLoadingMaxRetry: 12,
           manifestLoadingRetryDelay: 1000,
@@ -342,12 +345,12 @@ app.get('/player', (_req, res) => {
           })
 
           if (data.details === 'bufferStalledError') {
-            softRecover('bufferStalledError')
+            log('bufferStalledError observed - waiting before recovery')
             return
           }
 
           if (data.details === 'bufferNudgeOnStall') {
-            softRecover('bufferNudgeOnStall')
+            log('bufferNudgeOnStall observed - waiting before recovery')
             return
           }
 
@@ -390,7 +393,7 @@ app.get('/player', (_req, res) => {
         hls.loadSource(src)
         hls.attachMedia(audio)
 
-        log('HLS.js started')
+        log('HLS.js started - stable live sync 90s')
         setTimeout(() => { isStarting = false }, 1000)
       } else if (audio.canPlayType('application/vnd.apple.mpegurl')) {
         audio.src = src
