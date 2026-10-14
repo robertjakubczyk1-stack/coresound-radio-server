@@ -1,8 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { createWriteStream } from 'node:fs'
-import { Transform } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
+import { writeLimitedAudio } from './limited-audio.js'
 import { openSafeAudioStream } from './safe-audio-request.js'
 import { config } from './config.js'
 import { log } from './logger.js'
@@ -196,25 +194,12 @@ export class TrackCache {
         }
       }
 
-      let receivedBytes = 0
-      const sizeGuard = new Transform({
-        transform(chunk, _encoding, callback) {
-          receivedBytes += chunk.length
-          if (receivedBytes > config.maxAudioBytes) {
-            callback(new Error('audio_download_too_large'))
-          } else {
-            callback(null, chunk)
-          }
-        },
-      })
-
-      // Stream directly to disk. Enforce the limit even without Content-Length:
-      // no entire audio file is ever held in a Node.js buffer.
-      await pipeline(
+      // Stream directly to disk with a strict byte budget.
+      const receivedBytes = await writeLimitedAudio(
         response,
-        sizeGuard,
-        createWriteStream(tempPath, { flags: 'wx' }),
-        { signal: controller.signal },
+        tempPath,
+        config.maxAudioBytes,
+        controller.signal,
       )
 
       const validation = await validateCachedAudio(tempPath)
