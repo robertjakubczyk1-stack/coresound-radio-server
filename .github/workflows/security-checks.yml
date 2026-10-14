@@ -1,0 +1,36 @@
+name: Radio security checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  radio-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node 24
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Syntax checks
+        run: |
+          node --check src/safe-audio-request.js
+          node --check src/limited-audio.js
+          node --check src/track-cache.js
+          node --check src/server.js
+      - name: Tests
+        run: npm test
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
