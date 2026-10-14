@@ -24,6 +24,14 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci
+      - name: Check reproducible dependency security
+        run: |
+          npm audit fix --package-lock-only --ignore-scripts
+          git diff -- package-lock.json
+          if ! git diff --quiet -- package-lock.json; then
+            echo "Commit the updated package-lock.json from the printed diff."
+            exit 1
+          fi
       - name: Syntax checks
         run: |
           node --check src/safe-audio-request.js
