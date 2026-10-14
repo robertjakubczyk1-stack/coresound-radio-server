@@ -7,13 +7,14 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "NODE_ENV=development node src/server.js",
-    "check": "node src/check-env.js"
+    "check": "node src/check-env.js",
+    "test": "node --test"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.19.2"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24 <25"
   }
 }

@@ -89,6 +89,8 @@ app.get('/status', (_req, res) => {
 })
 
 app.get('/debug/hls', (_req, res) => {
+  // Detailed file-system diagnostics are never exposed in production.
+  if (process.env.NODE_ENV === 'production') return res.sendStatus(404)
   let files = []
   let exists = false
 
