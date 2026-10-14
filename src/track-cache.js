@@ -1,5 +1,9 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import { createWriteStream } from 'node:fs'
+import { Transform } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { openSafeAudioStream } from './safe-audio-request.js'
 import { config } from './config.js'
 import { log } from './logger.js'
 
@@ -153,27 +157,24 @@ export class TrackCache {
         url: Boolean(track.streamUrl),
       })
 
-      const response = await fetch(track.streamUrl, {
+      const response = await openSafeAudioStream(track.streamUrl, {
         signal: controller.signal,
-        headers: {
-          Accept: 'audio/*,*/*',
-          'User-Agent': 'CoreSound-Radio-Buffer-Engine/1.0',
-        },
-        cache: 'no-store',
       })
 
-      if (!response.ok) {
+      if (response.statusCode !== 200) {
+        response.destroy()
         return {
           ok: false,
           reason: 'http_error',
-          status: response.status,
+          status: response.statusCode,
           track,
         }
       }
 
-      const contentType = String(response.headers.get('content-type') || '').toLowerCase()
+      const contentType = String(response.headers['content-type'] || '').toLowerCase()
 
       if (contentType.includes('text/html')) {
+        response.destroy()
         return {
           ok: false,
           reason: 'html_content_type',
@@ -182,10 +183,11 @@ export class TrackCache {
         }
       }
 
-      const contentLengthRaw = response.headers.get('content-length')
+      const contentLengthRaw = response.headers['content-length']
       const contentLength = Number.parseInt(contentLengthRaw || '', 10)
 
       if (Number.isFinite(contentLength) && contentLength > config.maxAudioBytes) {
+        response.destroy()
         return {
           ok: false,
           reason: 'content_too_large',
@@ -194,19 +196,26 @@ export class TrackCache {
         }
       }
 
-      const arrayBuffer = await response.arrayBuffer()
-      const buffer = Buffer.from(arrayBuffer)
+      let receivedBytes = 0
+      const sizeGuard = new Transform({
+        transform(chunk, _encoding, callback) {
+          receivedBytes += chunk.length
+          if (receivedBytes > config.maxAudioBytes) {
+            callback(new Error('audio_download_too_large'))
+          } else {
+            callback(null, chunk)
+          }
+        },
+      })
 
-      if (buffer.length > config.maxAudioBytes) {
-        return {
-          ok: false,
-          reason: 'download_too_large',
-          size: buffer.length,
-          track,
-        }
-      }
-
-      await fs.writeFile(tempPath, buffer)
+      // Stream directly to disk. Enforce the limit even without Content-Length:
+      // no entire audio file is ever held in a Node.js buffer.
+      await pipeline(
+        response,
+        sizeGuard,
+        createWriteStream(tempPath, { flags: 'wx' }),
+        { signal: controller.signal },
+      )
 
       const validation = await validateCachedAudio(tempPath)
 
@@ -216,7 +225,7 @@ export class TrackCache {
         return {
           ok: false,
           reason: validation.reason,
-          size: validation.size || buffer.length,
+          size: validation.size || receivedBytes,
           track,
         }
       }
@@ -246,7 +255,13 @@ export class TrackCache {
 
       return {
         ok: false,
-        reason: err?.name === 'AbortError' ? 'download_timeout' : 'download_failed',
+        reason: err?.message === 'audio_download_too_large'
+          ? 'download_too_large'
+          : err?.name === 'AbortError'
+            ? 'download_timeout'
+            : err?.message?.startsWith('unsafe_audio') || err?.message === 'audio_dns_failed'
+              ? 'unsafe_audio_source'
+              : 'download_failed',
         message: err instanceof Error ? err.message : String(err),
         track,
       }
