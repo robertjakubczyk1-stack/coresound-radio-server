@@ -13,7 +13,7 @@ for (const [subnet, prefix] of [
 ]) blocked.addSubnet(subnet, prefix, 'ipv4')
 
 for (const [subnet, prefix] of [
-  ['::', 128], ['::1', 128], ['::ffff:0:0', 96],
+  ['::', 128], ['::1', 128],
   ['64:ff9b::', 96], ['100::', 64], ['2001:db8::', 32],
   ['2002::', 16], ['fc00::', 7], ['fe80::', 10],
   ['ff00::', 8],
