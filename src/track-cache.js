@@ -159,7 +159,7 @@ export class TrackCache {
         signal: controller.signal,
       })
 
-      if (response.statusCode !== 200) {
+      if (response.statusCode !== 200 && response.statusCode !== 206) {
         response.destroy()
         return {
           ok: false,
